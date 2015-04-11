@@ -588,14 +588,19 @@ abstract class TreeGen {
   *
   *  1.
   *
-  *    for (P <- G) E   ==>   G.foreach (P => E)
+  *    for (P <- G) yield E           ==>  G.map (P => E)
+  *    for (implicit P <- G) yield E  ==>  G.map (implicit P => E)
   *
   *     Here and in the following (P => E) is interpreted as the function (P => E)
   *     if P is a variable pattern and as the partial function { case P => E } otherwise.
   *
+  *     (implicit P => E) is interpreted as the function (implicit P => E) if P is
+  *     a variable pattern and as the function { X => implicit val P = X ; E } otherwise.
+  *
   *  2.
   *
-  *    for (P <- G) yield E  ==>  G.map (P => E)
+  *    for (P <- G) E           ==>   G.foreach (P => E)
+  *    for (implicit P <- G) E  ==>   G.foreach (implicit P => E)
   *
   *  3.
   *
@@ -700,45 +705,43 @@ abstract class TreeGen {
 
     def implicitGeneratorDesugaring(pos: Position, pat: Tree, rhs: Tree, hasImplicit: Boolean, rest: List[Tree]) = {
       // Split the rest of the clauses into those we'll desugar in this way and those we'll recursively mkFor
-      val candidates = rest.takeWhile(enum => !isGenerator(enum))
-      assert(!candidates.isEmpty)
-      val rest1 = rest.drop(candidates.length)
-      var childForExpr = if (rest1.isEmpty) body else mkFor(rest1, body)
+      val clausesToCollapse = rest.takeWhile(enum => !isGenerator(enum))
+      val rest1 = rest.drop(clausesToCollapse.length)
 
-      // When we handle a guard in a for comprehension we will wrap the result in Option.
-      // Remember how many times this has happened so that we can flatten them out afterwards.
-      var flattensNeeded = 0
-
-      // Collapse the value definitions and guards into the block of the childForExpr
-      candidates.reverse.foreach {
-        case ValEq(pat, rhs) => {
-          val implicitValDef = mkPatDef(Modifiers(PARAM), pat, rhs).map(atPos(pat.pos))
-          childForExpr = Block(implicitValDef, childForExpr)
-        }
-        case ImplicitValEq(pat, rhs) => {
-          val valDef = mkPatDef(Modifiers(PARAM | IMPLICIT), pat, rhs).map(atPos(pat.pos))
-          childForExpr = Block(valDef, childForExpr)
-        }
-        case Filter(test) =>
-          if (isLoop) {
-            childForExpr = If(test, childForExpr, EmptyTree)
-          } else {
-            flattensNeeded += 1
-            // TODO: test this out
-            childForExpr = If(test, Apply(Select(Ident("Some"), nme.apply), List(childForExpr)), Ident("None"))
+      // Collapse the value definitions and guards into the block of the childForExpr, working right to left.
+      val innermostBody = if (rest1.isEmpty) body else mkFor(rest1, body)
+      val childForExpr = clausesToCollapse.foldRight(innermostBody) { (forClause, innerExpr) =>
+        forClause match {
+          case ValEq(pat, rhs) => {
+            val implicitValDef = mkPatDef(Modifiers(PARAM), pat, rhs).map(atPos(pat.pos))
+            Block(implicitValDef, innerExpr)
           }
+          case ImplicitValEq(pat, rhs) => {
+            val valDef = mkPatDef(Modifiers(PARAM | IMPLICIT), pat, rhs).map(atPos(pat.pos))
+            Block(valDef, innerExpr)
+          }
+          case Filter(test) =>
+            if (isLoop)
+              If(test, innerExpr, EmptyTree)
+            else
+              If(test, Apply(Select(Ident(nme.Some), nme.apply), List(innerExpr)), Ident(nme.None))
+        }
       }
 
       val methodToUse = if (rest1.isEmpty) mapName else flatMapName
-      var result = makeCombination(closurePos(pos), methodToUse, rhs, pat, childForExpr, true)
+      var result = makeCombination(closurePos(pos), methodToUse, rhs, pat, childForExpr, hasImplicit)
 
-      // TODO: test this out
-      val termName = freshTermName()
-      val param = mkPatDef(Modifiers(PARAM), Ident(termName), EmptyTree)
-      val identity = Function(param, Ident(termName))
-      (1 to flattensNeeded).foreach { _ =>
-        result = Apply(Select(result, flatMapName), List(identity))
+      // If this is a for comprehension, each Filter wrapped the value in Option[_] so we need to flatten it.
+      if (!isLoop) {
+        val termName = freshTermName()
+        val param = mkPatDef(Modifiers(PARAM), Ident(termName), EmptyTree)
+        val identity = Function(param, Ident(termName))
+
+        val flattensNeeded = clausesToCollapse.filter { case Filter(_) => true ; case _ => false}.size
+        for (_ <- 1 to flattensNeeded)
+          result = Apply(Select(result, flatMapName), List(identity))
       }
+
       result
     }
 
@@ -775,8 +778,8 @@ abstract class TreeGen {
       // Needs to come before Rule 6 so that we catch "ValFrom(_, _) :: ImplicitValEq(_, _) :: rest" here.
       case (t @ ImplicitValFrom(pat, rhs)) :: rest =>
         implicitGeneratorDesugaring(t.pos, pat, rhs, true, rest)
-      case (t @ ValFrom(pat, rhs)) :: ImplicitValEq(_, _) :: rest =>
-        implicitGeneratorDesugaring(t.pos, pat, rhs, false, rest)
+      case (t @ ValFrom(pat, rhs)) :: (u @ ImplicitValEq(_, _)) :: rest =>
+        implicitGeneratorDesugaring(t.pos, pat, rhs, false, u :: rest)
 
       // Rule 6
       case (t @ ValFrom(pat, rhs)) :: rest =>
