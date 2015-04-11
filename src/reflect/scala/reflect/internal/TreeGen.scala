@@ -708,7 +708,7 @@ abstract class TreeGen {
       val clausesToCollapse = rest.takeWhile(enum => !isGenerator(enum))
       val rest1 = rest.drop(clausesToCollapse.length)
 
-      // Collapse the value definitions and guards into the block of the childForExpr, working right to left.
+      // Collapse the value definitions and guards into the body, working right to left.
       val innermostBody = if (rest1.isEmpty) body else mkFor(rest1, body)
       val childForExpr = clausesToCollapse.foldRight(innermostBody) { (forClause, innerExpr) =>
         forClause match {
@@ -747,9 +747,9 @@ abstract class TreeGen {
 
     enums match {
       // SIP-24 Rules 1 and 2
-      case (t @ ValFrom(pat, rhs)) :: Nil => // p <- e
+      case (t @ ValFrom(pat, rhs)) :: Nil =>
         makeCombination(closurePos(t.pos), mapName, rhs, pat, body)
-      case (t @ ImplicitValFrom(pat, rhs)) :: Nil => // implicit p <- e
+      case (t @ ImplicitValFrom(pat, rhs)) :: Nil =>
         makeCombination(closurePos(t.pos), mapName, rhs, pat, body, true)
 
       // SIP-24 Rules 3 and 4
@@ -768,11 +768,13 @@ abstract class TreeGen {
 
       // Rule 5
       case (t @ ValFrom(pat, rhs)) :: Filter(test) :: rest =>
-        mkFor(ValFrom(pat, makeCombination(rhs.pos union test.pos, nme.withFilter, rhs, pat.duplicate, test)).setPos(t.pos) :: rest, sugarBody)
+        val augmentedRHS = makeCombination(rhs.pos union test.pos, nme.withFilter, rhs, pat.duplicate, test)
+        mkFor(ValFrom(pat, augmentedRHS).setPos(t.pos) :: rest, sugarBody)
 
       // Not in the rules, but we can just fold an "if guard" into an implicit generator too.
       case (t @ ImplicitValFrom(pat, rhs)) :: Filter(test) :: rest =>
-        mkFor(ImplicitValFrom(pat, makeCombination(rhs.pos union test.pos, nme.withFilter, rhs, pat.duplicate, test)).setPos(t.pos) :: rest, sugarBody)
+        val augmentedRHS = makeCombination(rhs.pos union test.pos, nme.withFilter, rhs, pat.duplicate, test)
+        mkFor(ImplicitValFrom(pat, augmentedRHS).setPos(t.pos) :: rest, sugarBody)
 
       // SIP-24 Rule 7
       // Needs to come before Rule 6 so that we catch "ValFrom(_, _) :: ImplicitValEq(_, _) :: rest" here.
