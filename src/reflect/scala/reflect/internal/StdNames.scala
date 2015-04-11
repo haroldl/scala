@@ -212,6 +212,7 @@ trait StdNames {
     final val EQUALSkw: TermName    = kw("=")
     final val ARROWkw: TermName     = kw("=>")
     final val LARROWkw: TermName    = kw("<-")
+    final val LDARROWkw: TermName   = kw("<=")
     final val SUBTYPEkw: TermName   = kw("<:")
     final val VIEWBOUNDkw: TermName = kw("<%")
     final val SUPERTYPEkw: TermName = kw(">:")
