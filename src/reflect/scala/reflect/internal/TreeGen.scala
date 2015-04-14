@@ -515,6 +515,20 @@ abstract class TreeGen {
     }
   }
 
+  /** Encode/decode fq"implicit $pat <- $rhs" enumerator as q"`<=`($pat, $rhs)" */
+  object ImplicitValFrom {
+    def apply(pat: Tree, rhs: Tree): Tree =
+      Apply(Ident(nme.LDARROWkw).updateAttachment(ForAttachment),
+            List(pat, rhs))
+
+    def unapply(tree: Tree): Option[(Tree, Tree)] = tree match {
+      case Apply(id @ Ident(nme.LDARROWkw), List(pat, rhs))
+        if id.hasAttachment[ForAttachment.type] =>
+        Some((pat, rhs))
+      case _ => None
+    }
+  }
+
   /** Encode/decode fq"$pat = $rhs" enumerator as q"$pat = $rhs" */
   object ValEq {
     def apply(pat: Tree, rhs: Tree): Tree =
@@ -522,6 +536,19 @@ abstract class TreeGen {
 
     def unapply(tree: Tree): Option[(Tree, Tree)] = tree match {
       case Assign(pat, rhs)
+        if tree.hasAttachment[ForAttachment.type] =>
+        Some((pat, rhs))
+      case _ => None
+    }
+  }
+
+  /** Encode/decode fq"implicit $pat = $rhs" enumerator as q"$pat = $rhs" */
+  object ImplicitValEq {
+    def apply(pat: Tree, rhs: Tree): Tree =
+      AssignOrNamedArg(pat, rhs).updateAttachment(ForAttachment)
+
+    def unapply(tree: Tree): Option[(Tree, Tree)] = tree match {
+      case AssignOrNamedArg(pat, rhs)
         if tree.hasAttachment[ForAttachment.type] =>
         Some((pat, rhs))
       case _ => None
@@ -561,14 +588,19 @@ abstract class TreeGen {
   *
   *  1.
   *
-  *    for (P <- G) E   ==>   G.foreach (P => E)
+  *    for (P <- G) yield E           ==>  G.map (P => E)
+  *    for (implicit P <- G) yield E  ==>  G.map (implicit P => E)
   *
   *     Here and in the following (P => E) is interpreted as the function (P => E)
   *     if P is a variable pattern and as the partial function { case P => E } otherwise.
   *
+  *     (implicit P => E) is interpreted as the function (implicit P => E) if P is
+  *     a variable pattern and as the function { X => implicit val P = X ; E } otherwise.
+  *
   *  2.
   *
-  *    for (P <- G) yield E  ==>  G.map (P => E)
+  *    for (P <- G) E           ==>   G.foreach (P => E)
+  *    for (implicit P <- G) E  ==>   G.foreach (implicit P => E)
   *
   *  3.
   *
@@ -597,43 +629,51 @@ abstract class TreeGen {
   *    If any of the P_i are variable patterns, the corresponding `x_i @ P_i' is not generated
   *    and the variable constituting P_i is used instead of x_i
   *
-  *  @param mapName      The name to be used for maps (either map or foreach)
-  *  @param flatMapName  The name to be used for flatMaps (either flatMap or foreach)
   *  @param enums        The enumerators in the for expression
-  *  @param body          The body of the for expression
+  *  @param sugarBody    The body of the for expression
   */
   def mkFor(enums: List[Tree], sugarBody: Tree)(implicit fresh: FreshNameCreator): Tree = {
-    val (mapName, flatMapName, body) = sugarBody match {
-      case Yield(tree) => (nme.map, nme.flatMap, tree)
-      case _           => (nme.foreach, nme.foreach, sugarBody)
+    /* Use these variables so that we can handle for loops and for comprehensions with the same logic:
+     *   mapName      The name to be used for maps (either map or foreach)
+     *   flatMapName  The name to be used for flatMaps (either flatMap or foreach)
+     */
+    val (mapName, flatMapName, body, isLoop) = sugarBody match {
+      case Yield(tree) => (nme.map, nme.flatMap, tree, false)
+      case _           => (nme.foreach, nme.foreach, sugarBody, true)
     }
 
     /* make a closure pat => body.
      * The closure is assigned a transparent position with the point at pos.point and
      * the limits given by pat and body.
      */
-    def makeClosure(pos: Position, pat: Tree, body: Tree): Tree = {
+    def makeClosure(pos: Position, pat: Tree, body: Tree, isImplicit: Boolean = false): Tree = {
       def wrapped  = wrappingPos(List(pat, body))
       def splitpos = (if (pos != NoPosition) wrapped.withPoint(pos.point) else pos).makeTransparent
       matchVarPattern(pat) match {
         case Some((name, tpt)) =>
-          Function(
-            List(atPos(pat.pos) { ValDef(Modifiers(PARAM), name.toTermName, tpt, EmptyTree) }),
-            body) setPos splitpos
+          val mods = Modifiers(if (isImplicit) (PARAM | IMPLICIT) else PARAM)
+          Function(List(atPos(pat.pos) { ValDef(mods, name.toTermName, tpt, EmptyTree) }), body) setPos splitpos
         case None =>
           atPos(splitpos) {
-            mkVisitor(List(CaseDef(pat, EmptyTree, body)), checkExhaustive = false)
+            if (!isImplicit)
+              mkVisitor(List(CaseDef(pat, EmptyTree, body)), checkExhaustive = false)
+            else {
+              val termName = freshTermName()
+              val param = mkPatDef(Modifiers(PARAM), Ident(termName), EmptyTree)
+              val implicitVals = mkPatDef(Modifiers(PARAM | IMPLICIT), pat, Ident(termName)).map(atPos(pat.pos))
+              Function(param, Block(implicitVals, body))
+            }
           }
       }
     }
 
     /* Make an application  qual.meth(pat => body) positioned at `pos`.
      */
-    def makeCombination(pos: Position, meth: TermName, qual: Tree, pat: Tree, body: Tree): Tree =
+    def makeCombination(pos: Position, meth: TermName, qual: Tree, pat: Tree, body: Tree, isImplicit: Boolean = false): Tree =
       // ForAttachment on the method selection is used to differentiate
       // result of for desugaring from a regular method call
       Apply(Select(qual, meth) setPos qual.pos updateAttachment ForAttachment,
-        List(makeClosure(pos, pat, body))) setPos pos
+        List(makeClosure(pos, pat, body, isImplicit))) setPos pos
 
     /* If `pat` is not yet a `Bind` wrap it in one with a fresh name */
     def makeBind(pat: Tree): Tree = pat match {
@@ -657,14 +697,93 @@ abstract class TreeGen {
         rangePos(genpos.source, genpos.start, genpos.point, end)
       }
 
+    def isGenerator(enum: Tree): Boolean = enum match {
+      case ValFrom(_, _) => true
+      case ImplicitValFrom(_, _) => true
+      case _ => false
+    }
+
+    def implicitGeneratorDesugaring(pos: Position, pat: Tree, rhs: Tree, hasImplicit: Boolean, rest: List[Tree]) = {
+      // Split the rest of the clauses into those we'll desugar in this way and those we'll recursively mkFor
+      val clausesToCollapse = rest.takeWhile(enum => !isGenerator(enum))
+      val rest1 = rest.drop(clausesToCollapse.length)
+
+      // Collapse the value definitions and guards into the body, working right to left.
+      val innermostBody = if (rest1.isEmpty) body else mkFor(rest1, body)
+      val childForExpr = clausesToCollapse.foldRight(innermostBody) { (forClause, innerExpr) =>
+        forClause match {
+          case ValEq(pat, rhs) => {
+            val implicitValDef = mkPatDef(Modifiers(PARAM), pat, rhs).map(atPos(pat.pos))
+            Block(implicitValDef, innerExpr)
+          }
+          case ImplicitValEq(pat, rhs) => {
+            val valDef = mkPatDef(Modifiers(PARAM | IMPLICIT), pat, rhs).map(atPos(pat.pos))
+            Block(valDef, innerExpr)
+          }
+          case Filter(test) =>
+            if (isLoop)
+              If(test, innerExpr, EmptyTree)
+            else
+              If(test, Apply(Select(Ident(definitions.SomeModule), nme.apply), List(innerExpr)), Ident(definitions.NoneModule))
+        }
+      }
+
+      val methodToUse = if (rest1.isEmpty) mapName else flatMapName
+      var result = makeCombination(closurePos(pos), methodToUse, rhs, pat, childForExpr, hasImplicit)
+
+      // If this is a for comprehension, each Filter wrapped the value in Option[_] so we need to flatten it.
+      if (!isLoop) {
+        val termName = freshTermName()
+        val param = mkPatDef(Modifiers(PARAM), Ident(termName), EmptyTree)
+        val identity = Function(param, Ident(termName))
+
+        val flattensNeeded = clausesToCollapse.filter { case Filter(_) => true ; case _ => false}.size
+        for (_ <- 1 to flattensNeeded)
+          result = Apply(Select(result, flatMapName), List(identity))
+      }
+
+      result
+    }
+
     enums match {
+      // SIP-24 Rules 1 and 2
       case (t @ ValFrom(pat, rhs)) :: Nil =>
         makeCombination(closurePos(t.pos), mapName, rhs, pat, body)
+      case (t @ ImplicitValFrom(pat, rhs)) :: Nil =>
+        makeCombination(closurePos(t.pos), mapName, rhs, pat, body, true)
+
+      // SIP-24 Rules 3 and 4
       case (t @ ValFrom(pat, rhs)) :: (rest @ (ValFrom(_, _) :: _)) =>
         makeCombination(closurePos(t.pos), flatMapName, rhs, pat,
                         mkFor(rest, sugarBody))
+      case (t @ ValFrom(pat, rhs)) :: (rest @ (ImplicitValFrom(_, _) :: _)) =>
+        makeCombination(closurePos(t.pos), flatMapName, rhs, pat,
+                        mkFor(rest, sugarBody))
+      case (t @ ImplicitValFrom(pat, rhs)) :: (rest @ (ValFrom(_, _) :: _)) =>
+        makeCombination(closurePos(t.pos), flatMapName, rhs, pat,
+                        mkFor(rest, sugarBody), true)
+      case (t @ ImplicitValFrom(pat, rhs)) :: (rest @ (ImplicitValFrom(_, _) :: _)) =>
+        makeCombination(closurePos(t.pos), flatMapName, rhs, pat,
+                        mkFor(rest, sugarBody), true)
+
+      // Rule 5
       case (t @ ValFrom(pat, rhs)) :: Filter(test) :: rest =>
-        mkFor(ValFrom(pat, makeCombination(rhs.pos union test.pos, nme.withFilter, rhs, pat.duplicate, test)).setPos(t.pos) :: rest, sugarBody)
+        val augmentedRHS = makeCombination(rhs.pos union test.pos, nme.withFilter, rhs, pat.duplicate, test)
+        mkFor(ValFrom(pat, augmentedRHS).setPos(t.pos) :: rest, sugarBody)
+
+      // Not in the rules, but we can just fold an "if guard" into an implicit generator too.
+      case (t @ ImplicitValFrom(pat, rhs)) :: Filter(test) :: rest =>
+        val augmentedRHS = makeCombination(rhs.pos union test.pos, nme.withFilter, rhs, pat.duplicate, test)
+        mkFor(ImplicitValFrom(pat, augmentedRHS).setPos(t.pos) :: rest, sugarBody)
+
+      // SIP-24 Rule 7
+      // Needs to come before Rule 6 so that we catch "ValFrom(_, _) :: ImplicitValEq(_, _) :: rest" here.
+      case (t @ ImplicitValFrom(pat, rhs)) :: rest =>
+        implicitGeneratorDesugaring(t.pos, pat, rhs, true, rest)
+      case (t @ ValFrom(pat, rhs)) :: (u @ ImplicitValEq(_, _)) :: rest =>
+        implicitGeneratorDesugaring(t.pos, pat, rhs, false, u :: rest)
+
+      // Rule 6
       case (t @ ValFrom(pat, rhs)) :: rest =>
         val valeqs = rest.take(definitions.MaxTupleArity - 1).takeWhile { ValEq.unapply(_).nonEmpty }
         assert(!valeqs.isEmpty)
@@ -684,9 +803,9 @@ abstract class TreeGen {
           else rangePos(t.pos.source, t.pos.start, t.pos.point, rhs1.pos.end)
         val vfrom1 = ValFrom(atPos(wrappingPos(allpats)) { mkTuple(allpats) }, rhs1).setPos(pos1)
         mkFor(vfrom1 :: rest1, sugarBody)
+
       case _ =>
         EmptyTree //may happen for erroneous input
-
     }
   }
 
@@ -761,10 +880,20 @@ abstract class TreeGen {
   }
 
   /** Create tree for for-comprehension generator <val pat0 <- rhs0> */
-  def mkGenerator(pos: Position, pat: Tree, valeq: Boolean, rhs: Tree)(implicit fresh: FreshNameCreator): Tree = {
+  def mkGenerator(pos: Position, pat: Tree, valeq: Boolean, hasImplicit: Boolean, rhs: Tree)(implicit fresh: FreshNameCreator): Tree = {
     val pat1 = patvarTransformer.transform(pat)
-    if (valeq) ValEq(pat1, rhs).setPos(pos)
-    else ValFrom(pat1, mkCheckIfRefutable(pat1, rhs)).setPos(pos)
+    if (valeq) {
+      if (hasImplicit)
+        ImplicitValEq(pat1, rhs).setPos(pos)
+      else
+        ValEq(pat1, rhs).setPos(pos)
+    }
+    else {
+      if (hasImplicit)
+        ImplicitValFrom(pat1, mkCheckIfRefutable(pat1, rhs)).setPos(pos)
+      else
+        ValFrom(pat1, mkCheckIfRefutable(pat1, rhs)).setPos(pos)
+    }
   }
 
   def mkCheckIfRefutable(pat: Tree, rhs: Tree)(implicit fresh: FreshNameCreator) =

@@ -1,0 +1,7 @@
+implicits-in-for-comprehensions-neg.scala:12: error: could not find implicit value for parameter s: String
+    } yield g
+            ^
+implicits-in-for-comprehensions-neg.scala:23: error: could not find implicit value for parameter i: Int
+    } yield f
+            ^
+two errors found
